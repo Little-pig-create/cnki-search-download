@@ -60,6 +60,12 @@ python3 $S verify --dir PDF --in rec_abs.json
 - 中文库有 SCI 筛选，**没有 SSCI**；外文库不支持来源类别筛选，也没有 PDF。
 - 仅用于个人研究用途。请遵守所在机构与知网的使用条款。
 
+## 安全
+
+- 仓库内**不含任何账号、Cookie、令牌**；`.gitignore` 已排除 `*.json`、`PDF/`、缓存目录。
+- 运行时的 Cookie 只保存在本机 `~/.cache/cnki-cookies.json`（权限 0600），不会写进仓库，也不会上传。
+- 代码只打印 Cookie 的**条数与路径**，不打印值。
+
 ## 作为 skill 使用
 
 把本仓库放进 agent 的 skills 目录（例如 `~/.agents/skills/cnki-search-download/`），
