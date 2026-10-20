@@ -1,0 +1,2 @@
+# 运行依赖（仅 Python 包；浏览器与系统工具见 SKILL.md）
+playwright>=1.40
