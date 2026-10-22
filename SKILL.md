@@ -18,13 +18,15 @@ pip install -r ~/.agents/skills/cnki-search-download/requirements.txt   # playwr
 | Python 3.9+ | ✅ | 脚本运行 |
 | `playwright`（pip） | ✅ | 连接已开调试端口的 Chrome（**无需** `playwright install` 下载浏览器） |
 | Google Chrome | ✅ | 承载会话与下载 |
+| `xdotool` | 可选（推荐） | 静默启动时把窗口直接隐藏，做到零闪现；没有则退化为最小化 |
 | `notify-send`（libnotify-bin） | 可选 | 遇到验证码时弹桌面通知 |
 | `pdftotext` / `pdfinfo`（poppler-utils） | 可选 | 校验 PDF 文本层与页数 |
 
 ## 静默运行（默认）
 
 - **检索 / 摘要 / 题录**：走 HTTP，**根本不开窗口**
-- **下载**：需要一个有头浏览器，但默认**最小化静默**（`--launch` 时窗口最小化，不打断你）
+- **下载**：需要一个有头浏览器，但默认**静默**——装了 `xdotool` 时窗口启动后立即隐藏（零闪现），
+  没装则退化为最小化
 - **遇到验证码**：自动把窗口还原、前置，并发桌面通知；你拖完拼图脚本自己继续
 - `--no-silent` 可让窗口正常显示；`--headless` 仅用于调试（**下载会被站点拦，实测不可用**）
 

@@ -2,13 +2,15 @@
 import json
 import os
 import pathlib
+import subprocess
+import sys
 import re
 import time
 
 from utils import CDP, CHROME, PROFILE, _PROCS, fail
 
 class Browser:
-    def __init__(self, cdp=CDP):
+    def __init__(self, cdp=CDP, quiet=False):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -17,18 +19,27 @@ class Browser:
         try:
             self.b = self._p.chromium.connect_over_cdp(cdp)
         except Exception:
+            try:                     # 连不上时先释放 playwright，避免同进程二次启动冲突
+                self._p.stop()
+            except Exception:
+                pass
+            if quiet:
+                sys.exit(2)
             fail("连不上 CDP %s —— 用 --remote-debugging-port 启动已授权 Chrome，或加 --launch 让脚本自启" % cdp, 2)
         ctx = self.b.contexts[0]
         pages = [p for p in ctx.pages if "cnki.net" in p.url]
         self.ctx = ctx
         self.page = pages[0] if pages else ctx.new_page()
+        # 只对"本脚本启动的"浏览器静默；用户自己的窗口不动
+        owned = bool(_PROCS[0] and _PROCS[0].poll() is None)
+        if SILENT and owned:
+            _set_bounds(self, state="minimized")         # 先最小化，再导航（缩短闪现）
         if "cnki.net" not in self.page.url:
             self.page.goto("https://kns.cnki.net/kns8s/defaultresult/index",
                            wait_until="domcontentloaded", timeout=40000)
             self.page.wait_for_timeout(1500)
-        # 只对"本脚本启动的"浏览器静默；用户自己的窗口不动
-        if SILENT and _PROCS[0] and _PROCS[0].poll() is None:
-            _set_bounds(self, state="minimized")
+            if SILENT and owned:
+                _set_bounds(self, state="minimized")     # 导航后再压一次
 
     def close(self):
         try:
@@ -59,11 +70,16 @@ def launch_browser(port=9222, profile=PROFILE, headless=False, timeout=25, silen
         args.append("--headless=new")
     if silent and not headless:
         # 静默：窗口放到屏幕外，遇到验证码再移回可见区域
-        args += ["--window-position=-2400,-2400", "--window-size=1280,900"]
+        args += ["--window-position=-32000,-32000", "--window-size=1280,900"]
     args.append("about:blank")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
     _PROCS[0] = proc
+    if silent and not headless:
+        for _ in range(12):          # 尽早隐藏窗口，减少闪现
+            if _unmap_window(proc.pid):
+                break
+            time.sleep(0.25)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -131,10 +147,25 @@ def _save_cookies(cookies, ua):
         pass
 
 
-def harvest_cookies(profile=PROFILE, headless=True, port=9400):
-    """取 Cookie：优先借用已在跑的调试浏览器，没有再短暂启动一个。"""
+def _harvest_worker(port, profile, headless=True):
+    """子进程入口：启动浏览器取 Cookie，打印一行 JSON。"""
+    cdp = launch_browser(port, profile, headless=headless, silent=True)
     try:
-        b = Browser(CDP)
+        b = Browser(cdp)
+        try:
+            cookies = b.ctx.cookies("https://kns.cnki.net") + b.ctx.cookies("https://bar.cnki.net")
+            ua = b.page.evaluate("() => navigator.userAgent")
+        finally:
+            b.close()
+        print(json.dumps({"ua": ua, "cookies": cookies}, ensure_ascii=False))
+    finally:
+        shutdown_browser()
+
+
+def harvest_cookies(profile=PROFILE, headless=False, port=9400):
+    """取 Cookie：优先借用已在跑的调试浏览器；否则用子进程启动一个（避免事件循环冲突）。"""
+    try:
+        b = Browser(CDP, quiet=True)
         try:
             cookies = b.ctx.cookies("https://kns.cnki.net") + b.ctx.cookies("https://bar.cnki.net")
             ua = b.page.evaluate("() => navigator.userAgent")
@@ -145,19 +176,22 @@ def harvest_cookies(profile=PROFILE, headless=True, port=9400):
         return {"saved_at": time.time(), "ua": ua, "cookies": cookies}
     except SystemExit:
         pass
-    cdp = launch_browser(port, profile, headless)
-    try:
-        b = Browser(cdp)
-        try:
-            cookies = b.ctx.cookies("https://kns.cnki.net") + b.ctx.cookies("https://bar.cnki.net")
-            ua = b.page.evaluate("() => navigator.userAgent")
-        finally:
-            b.close()
-        _save_cookies(cookies, ua)
-        print("已刷新 Cookie 缓存（%d 条）→ %s" % (len(cookies), COOKIE_CACHE))
-        return {"saved_at": time.time(), "ua": ua, "cookies": cookies}
-    finally:
-        shutdown_browser()
+
+    # 没有可借用的浏览器：用子进程启动，取完即关
+    import subprocess
+    cmd = [sys.executable, os.path.abspath(__file__), "--harvest",
+           "--port", str(port), "--profile", profile]
+    if headless:
+        cmd.append("--headless")   # 无头会被站点拦，默认用有头+最小化
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    for line in reversed((r.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            data = json.loads(line)
+            _save_cookies(data["cookies"], data["ua"])
+            print("已刷新 Cookie 缓存（%d 条）→ %s" % (len(data["cookies"]), COOKIE_CACHE))
+            return {"saved_at": time.time(), "ua": data["ua"], "cookies": data["cookies"]}
+    fail("取 Cookie 失败：%s" % ((r.stderr or r.stdout or "").strip().splitlines() or ["未知错误"])[-1][:160], 2)
 
 
 class Http:
@@ -190,6 +224,39 @@ class Http:
         return self._req(url)[1]
 
 
+def _unmap_window(pid):
+    """有 xdotool 时把窗口直接隐藏（零闪现）；没有就跳过。"""
+    import shutil
+    if not shutil.which("xdotool"):
+        return False
+    try:
+        ids = subprocess.run(["xdotool", "search", "--pid", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+        for wid in ids:
+            subprocess.run(["xdotool", "windowunmap", wid], timeout=5,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return bool(ids)
+    except Exception:
+        return False
+
+
+def _map_window(pid):
+    import shutil
+    if not shutil.which("xdotool"):
+        return False
+    try:
+        ids = subprocess.run(["xdotool", "search", "--pid", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+        for wid in ids:
+            subprocess.run(["xdotool", "windowmap", wid], timeout=5,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["xdotool", "windowactivate", wid], timeout=5,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return bool(ids)
+    except Exception:
+        return False
+
+
 def _set_bounds(b, left=0, top=0, width=1280, height=900, state="normal"):
     """设置窗口位置/状态；state='minimized' 即静默。"""
     try:
@@ -215,6 +282,8 @@ def show_window(b):
         target = b.page.context.new_cdp_session(b.page)
     except Exception:
         target = None
+    if _PROCS[0] and _PROCS[0].poll() is None:
+        _map_window(_PROCS[0].pid)
     if _set_bounds(b, 80, 60):
         try:
             b.ctx.new_cdp_session(b.page).send("Page.bringToFront")
@@ -226,3 +295,14 @@ def show_window(b):
         return True
     except Exception:
         return False
+
+
+if __name__ == "__main__" and "--harvest" in sys.argv:
+    _ap_port, _ap_profile, _ap_headless = 9400, PROFILE, False
+    _argv = sys.argv[sys.argv.index("--harvest") + 1:]
+    if "--port" in _argv:
+        _ap_port = int(_argv[_argv.index("--port") + 1])
+    if "--profile" in _argv:
+        _ap_profile = _argv[_argv.index("--profile") + 1]
+    _ap_headless = "--headless" in _argv
+    _harvest_worker(_ap_port, _ap_profile, _ap_headless)
