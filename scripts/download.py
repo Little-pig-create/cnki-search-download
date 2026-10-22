@@ -7,7 +7,7 @@ import time
 
 from utils import PDF_LABEL, captcha_kind, fail, norm
 from utils import notify as _notify
-from session import Browser
+from session import Browser, show_window
 
 def _probe_download(b, row, outdir):
     """用共享 Cookie 的 APIRequestContext 直接取下载响应：
@@ -49,6 +49,8 @@ def _pause_for_human(b, a, kind):
     if verify_pages:
         print("  验证页：%s" % verify_pages[0][:96], flush=True)
     print("=" * 62 + "\n", flush=True)
+    # 静默模式下窗口在屏幕外：先移回可见区域，再前置
+    show_window(b)
     for p in b.ctx.pages:
         if "bar/verify" in p.url:
             try:

@@ -26,6 +26,9 @@ class Browser:
             self.page.goto("https://kns.cnki.net/kns8s/defaultresult/index",
                            wait_until="domcontentloaded", timeout=40000)
             self.page.wait_for_timeout(1500)
+        # 只对"本脚本启动的"浏览器静默；用户自己的窗口不动
+        if SILENT and _PROCS[0] and _PROCS[0].poll() is None:
+            _set_bounds(self, state="minimized")
 
     def close(self):
         try:
@@ -41,7 +44,7 @@ def _port_of(cdp):
     return int(m.group(1)) if m else 9222
 
 
-def launch_browser(port=9222, profile=PROFILE, headless=False, timeout=25):
+def launch_browser(port=9222, profile=PROFILE, headless=False, timeout=25, silent=False):
     """由脚本拉起 Chrome 并接管生命周期；退出时关闭它启动的进程。"""
     import subprocess, urllib.request
     url = "http://127.0.0.1:%d/json/version" % port
@@ -54,6 +57,9 @@ def launch_browser(port=9222, profile=PROFILE, headless=False, timeout=25):
             "--no-first-run", "--no-default-browser-check", "--disable-background-networking"]
     if headless:
         args.append("--headless=new")
+    if silent and not headless:
+        # 静默：窗口放到屏幕外，遇到验证码再移回可见区域
+        args += ["--window-position=-2400,-2400", "--window-size=1280,900"]
     args.append("about:blank")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
@@ -62,7 +68,8 @@ def launch_browser(port=9222, profile=PROFILE, headless=False, timeout=25):
     while time.time() < deadline:
         try:
             urllib.request.urlopen(url, timeout=1)
-            print("已启动 Chrome (pid %d, port %d%s)" % (proc.pid, port, ", headless" if headless else ""))
+            print("已启动 Chrome (pid %d, port %d%s)" % (
+                proc.pid, port, ", headless" if headless else (", silent" if silent else "")))
             return "http://127.0.0.1:%d" % port
         except Exception:
             if proc.poll() is not None:
@@ -97,6 +104,7 @@ def shutdown_browser():
 COOKIE_CACHE = pathlib.Path(os.environ.get("CNKI_COOKIE_CACHE",
                                            str(pathlib.Path.home()/".cache/cnki-cookies.json")))
 COOKIE_TTL = int(os.environ.get("CNKI_COOKIE_TTL", "3600"))
+SILENT = True   # 默认静默：窗口移出屏幕，遇到验证码再显示
 UA_DEFAULT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/155.0.0.0 Safari/537.36")
 
@@ -182,3 +190,39 @@ class Http:
         return self._req(url)[1]
 
 
+def _set_bounds(b, left=0, top=0, width=1280, height=900, state="normal"):
+    """设置窗口位置/状态；state='minimized' 即静默。"""
+    try:
+        sess = b.ctx.new_cdp_session(b.page)
+        wid = sess.send("Browser.getWindowForTarget")["windowId"]
+        if state != "normal":
+            sess.send("Browser.setWindowBounds", {"windowId": wid,
+                      "bounds": {"windowState": state}})
+        else:
+            sess.send("Browser.setWindowBounds", {"windowId": wid,
+                      "bounds": {"windowState": "normal"}})
+            sess.send("Browser.setWindowBounds", {"windowId": wid,
+                      "bounds": {"left": left, "top": top,
+                                 "width": width, "height": height}})
+        return True
+    except Exception:
+        return False
+
+
+def show_window(b):
+    """把静默窗口移回可见区域并前置（验证码时用）。"""
+    try:
+        target = b.page.context.new_cdp_session(b.page)
+    except Exception:
+        target = None
+    if _set_bounds(b, 80, 60):
+        try:
+            b.ctx.new_cdp_session(b.page).send("Page.bringToFront")
+        except Exception:
+            pass
+        return True
+    try:
+        b.page.bring_to_front()
+        return True
+    except Exception:
+        return False

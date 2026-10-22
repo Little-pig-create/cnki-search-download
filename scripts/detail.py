@@ -144,7 +144,7 @@ def _ids_from_detail(html):
     n = re.search(r'id="paramfilename"[^>]*value="([^"]+)"', html)
     if m and n:
         return m.group(1), n.group(1)
-    m = re.search(r"dbcode=([A-Z]+)&(?:amp;)?tablename=[A-Z]+&(?:amp;)?filename=([A-Za-z0-9]+)", html)
+    m = re.search(r"dbcode=([A-Z]+)&(?:amp;)?tablename=[A-Z0-9]+&(?:amp;)?filename=([A-Za-z0-9]+)", html)
     if m:
         return m.group(1), m.group(2)
     return None, None

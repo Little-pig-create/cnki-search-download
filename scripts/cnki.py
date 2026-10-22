@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import CDP, PROFILE, SORTS          # noqa: E402
 from session import (launch_browser, _port_of,  # noqa: E402
                      shutdown_browser)
+import session as _session  # noqa: E402
 from search import cmd_search                  # noqa: E402
 from detail import cmd_abstract, cmd_metadata  # noqa: E402
 from download import cmd_download, cmd_verify  # noqa: E402
@@ -30,7 +31,10 @@ def build_parser():
     ap.add_argument("--launch", action="store_true",
                     help="由脚本启动 Chrome（用指定 profile），命令结束后自动关闭")
     ap.add_argument("--profile", default=PROFILE, help="--launch 使用的 profile 目录")
-    ap.add_argument("--headless", action="store_true", help="--launch 时无头运行（风控更严）")
+    ap.add_argument("--headless", action="store_true", help="--launch 时无头运行（下载会被拦，仅调试用）")
+    ap.add_argument("--silent", dest="silent", action="store_true", default=True,
+                    help="--launch 时静默：窗口移出屏幕，遇验证码才显示（默认）")
+    ap.add_argument("--no-silent", dest="silent", action="store_false", help="正常显示窗口")
     ap.add_argument("--port", type=int, default=None, help="--launch 的调试端口")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -93,8 +97,9 @@ def build_parser():
 
 def main():
     a = build_parser().parse_args()
+    _session.SILENT = bool(a.silent)
     if a.launch:
-        a.cdp = launch_browser(a.port or _port_of(a.cdp), a.profile, a.headless)
+        a.cdp = launch_browser(a.port or _port_of(a.cdp), a.profile, a.headless, silent=a.silent)
     atexit.register(shutdown_browser)
     try:
         a.func(a)

@@ -21,6 +21,18 @@ pip install -r ~/.agents/skills/cnki-search-download/requirements.txt   # playwr
 | `notify-send`（libnotify-bin） | 可选 | 遇到验证码时弹桌面通知 |
 | `pdftotext` / `pdfinfo`（poppler-utils） | 可选 | 校验 PDF 文本层与页数 |
 
+## 静默运行（默认）
+
+- **检索 / 摘要 / 题录**：走 HTTP，**根本不开窗口**
+- **下载**：需要一个有头浏览器，但默认**最小化静默**（`--launch` 时窗口最小化，不打断你）
+- **遇到验证码**：自动把窗口还原、前置，并发桌面通知；你拖完拼图脚本自己继续
+- `--no-silent` 可让窗口正常显示；`--headless` 仅用于调试（**下载会被站点拦，实测不可用**）
+
+```bash
+# 全程静默：无浏览器也能跑，窗口最小化，验证码才出现
+python3 $S --launch download --in rec.json --dir PDF
+```
+
 ## 前置
 
 ```bash
