@@ -75,7 +75,9 @@ def build_parser():
     dl.add_argument("--in", dest="infile", required=True)
     dl.add_argument("--dir", required=True)
     dl.add_argument("--limit", type=int, default=0)
-    dl.add_argument("--gap", type=float, default=10.0, help="篇间隔秒，建议 ≥10")
+    dl.add_argument("--gap", type=float, default=10.0, help="篇间隔秒；并发时可设 0–2")
+    dl.add_argument("--concurrency", type=int, default=1, choices=[1, 2, 3, 4, 5, 6],
+                    help="并发下载标签数（默认 1；实测 3 并发约快 2.5 倍）")
     dl.add_argument("--wait", type=int, default=30, help="单篇等文件落盘的秒数")
     dl.add_argument("--state", default=None, help="台账路径（默认在 --dir 下）")
     dl.add_argument("--notify", dest="notify", action="store_true", default=True,

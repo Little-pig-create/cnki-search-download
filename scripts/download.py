@@ -113,137 +113,167 @@ def _retry_one(b, r, outdir, state, state_path, a):
     print("  retry %-10s %s %s" % (status, r["title"][:30], note), flush=True)
 
 
+def _download_one(b, r, outdir, a):
+    """下载单篇，返回 (status, note, fname)；不写台账、不打印。
+
+    每个 worker 用独立临时目录接收下载，再移入 outdir —— 并发时避免互相认领对方的文件。
+    """
+    import shutil, uuid
+    tmp = outdir / (".part_" + uuid.uuid4().hex[:8])
+    tmp.mkdir(exist_ok=True)
+    p = b.ctx.new_page()
+    cdp = b.ctx.new_cdp_session(p)
+    cdp.send("Browser.setDownloadBehavior",
+             {"behavior": "allow", "downloadPath": str(tmp), "eventsEnabled": True})
+    try:
+        cdp.send("Network.enable")
+        cdp.send("Network.setExtraHTTPHeaders",
+                 {"headers": {"Referer": r.get("detail_url") or "https://kns.cnki.net/"}})
+    except Exception:
+        pass
+    try:
+        p.goto(r["detail_url"], wait_until="domcontentloaded", timeout=40000)
+        p.wait_for_timeout(1200)
+        loc = p.locator('a:has-text("%s")' % PDF_LABEL)
+        if loc.count() == 0:
+            return "no_pdf_link", "caj=%d" % p.locator('a:has-text("CAJ")').count(), None
+        pdf_href = p.evaluate("""() => {
+            const byName = document.querySelector("a[name='pdfDown']");
+            if (byName && byName.href) return byName.href;
+            const a = [...document.querySelectorAll('a')]
+              .find(e => (e.getAttribute('href')||'').includes('/bar/download/order')
+                         && /PDF/.test(e.innerText||''));
+            return a ? a.getAttribute('href') : null; }""")
+        if pdf_href:
+            try:
+                p.goto(pdf_href, wait_until="commit", timeout=30000)
+            except Exception:
+                pass
+        else:
+            loc.first.click()
+        last_size = -1
+        for _ in range(int(a.wait * 2)):
+            time.sleep(0.5)
+            got = [f for f in tmp.iterdir() if not f.name.endswith(".crdownload")]
+            if got:
+                fp = got[0]
+                size = fp.stat().st_size
+                if size > 0 and size == last_size:      # 等文件写完
+                    magic = fp.open("rb").read(4)
+                    final = outdir / fp.name
+                    if final.exists():
+                        final = outdir / (fp.stem + "_" + uuid.uuid4().hex[:4] + fp.suffix)
+                    shutil.move(str(fp), str(final))
+                    return (("ok" if magic == b"%PDF" else "not_pdf"),
+                            "%dKB" % (final.stat().st_size // 1024), final.name)
+                last_size = size
+        vts = [q for q in b.ctx.pages if "bar/verify" in q.url and "verifySuccess" not in q.url]
+        # 保留验证页，交给 _pause_for_human 让用户处理；不要关掉
+        return ("verify" if vts else "timeout"), "verify_tabs=%d" % len(vts), None
+    except Exception as e:
+        return "error", "%s: %s" % (type(e).__name__, str(e)[:60]), None
+    finally:
+        p.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def cmd_download(a):
+    import threading
+
     src = json.loads(pathlib.Path(a.infile).read_text(encoding="utf-8"))
-    rows = src["rows"]
+    rows = [r for r in src["rows"] if r.get("detail_url")]
     outdir = pathlib.Path(a.dir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     state_path = pathlib.Path(a.state) if a.state else outdir / "download_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    lock = threading.Lock()
 
-    def done(r):
-        key = r.get("detail_url") or r.get("title")
-        return state.get(key, {}).get("status") == "ok"
+    key_of = lambda r: r.get("detail_url") or r.get("title")
 
-    b = Browser(a.cdp)
-    attempts = 0
-    try:
-        for i, r in enumerate(rows, 1):
-            if done(r) or not r.get("detail_url"):
-                continue
-            if a.limit and attempts >= a.limit:
-                break
-            attempts += 1
-            key = r.get("detail_url") or r.get("title")
-            before = {f.name for f in outdir.iterdir()}
-            if a.probe:
-                st, fname, note = _probe_download(b, r, outdir)
-                if fname:
-                    status, extra = "ok", "%s|%dKB" % (fname[:38], (outdir / fname).stat().st_size // 1024)
-                elif note == "captcha":
-                    print("  (XHR 探测遇到拼图，回落点击路径)", flush=True)
-                    status, extra = None, "captcha_page"
-                else:
-                    status, extra = None, note
-                if status:
-                    state[key] = {"status": status, "file": fname, "note": extra,
-                                  "title": r["title"],
-                                  "at": datetime.datetime.now().isoformat(timespec="seconds")}
-                    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-                    print("%3d %-11s %-40s %s" % (i, status, r["title"][:34], extra), flush=True)
-                    if status == "verify":
-                        kind = (extra or "").split(":")[1] if ":" in (extra or "") else None
-                        if a.on_verify == "stop":
-                            _pause_for_human(b, a, kind)
-                            fail("已暂停并等待人工完成验证；完成后重跑本命令（台账会跳过已完成）", 2)
-                        if not _pause_for_human(b, a, kind):
-                            fail("等待人工验证超时；已完成项已入台账，可稍后重跑", 2)
-                        st2, f2, n2 = _probe_download(b, r, outdir)
-                        if f2:
-                            state[key] = {"status": "ok", "file": f2, "note": "after_verify",
-                                          "title": r["title"],
-                                          "at": datetime.datetime.now().isoformat(timespec="seconds")}
-                            state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-                            print("  retry ok:", f2[:50], flush=True)
-                    time.sleep(a.gap)
-                    continue
-            p = b.ctx.new_page()
-            cdp = b.ctx.new_cdp_session(p)
-            cdp.send("Browser.setDownloadBehavior",
-                     {"behavior": "allow", "downloadPath": str(outdir), "eventsEnabled": True})
-            try:
-                cdp.send("Network.enable")
-                cdp.send("Network.setExtraHTTPHeaders",
-                         {"headers": {"Referer": r.get("detail_url") or "https://kns.cnki.net/"}})
-            except Exception:
-                pass
-            status, note, fname = "unknown", "", None
-            try:
-                p.goto(r["detail_url"], wait_until="domcontentloaded", timeout=40000)
-                p.wait_for_timeout(1500)
-                loc = p.locator('a:has-text("%s")' % PDF_LABEL)
-                if loc.count() == 0:
-                    status = "no_pdf_link"
-                    note = "caj=%d" % p.locator('a:has-text("CAJ")').count()
-                else:
-                    # 优先直接导航 PDF 的 order 链接（实测可下，比点按钮稳）
-                    pdf_href = p.evaluate("""() => {
-                        const byName = document.querySelector("a[name='pdfDown']");
-                        if (byName && byName.href) return byName.href;
-                        const a = [...document.querySelectorAll('a')]
-                          .find(e => (e.getAttribute('href')||'').includes('/bar/download/order')
-                                     && /PDF/.test(e.innerText||''));
-                        return a ? a.getAttribute('href') : null; }""")
-                    if pdf_href:
-                        try:
-                            p.goto(pdf_href, wait_until="commit", timeout=30000)
-                        except Exception:
-                            pass
-                    else:
-                        loc.first.click()
-                    for _ in range(a.wait):
-                        time.sleep(1)
-                        new = {x for x in {f.name for f in outdir.iterdir()} - before
-                               if not x.endswith(".crdownload")}
-                        if new:
-                            fname = sorted(new)[0]
-                            fp = outdir / fname
-                            magic = fp.open("rb").read(4)
-                            status = "ok" if magic == b"%PDF" else "not_pdf"
-                            note = "%dKB" % (fp.stat().st_size // 1024)
-                            break
-                    else:
-                        vts = [q for q in b.ctx.pages
-                               if "bar/verify" in q.url and "verifySuccess" not in q.url]
-                        status = "verify" if vts else "timeout"
-                        note = "verify_tabs=%d" % len(vts)
-                        for q in vts:
-                            q.close()
-            except Exception as e:
-                status, note = "error", "%s: %s" % (type(e).__name__, str(e)[:60])
-            finally:
-                p.close()
-            state[key] = {"status": status, "file": fname, "note": note,
-                          "title": r["title"], "at": datetime.datetime.now().isoformat(timespec="seconds")}
+    def record(r, status, note, fname):
+        with lock:
+            state[key_of(r)] = {"status": status, "file": fname, "note": note,
+                                "title": r["title"],
+                                "at": datetime.datetime.now().isoformat(timespec="seconds")}
             state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-            print("%3d %-11s %-40s %s" % (i, status, r["title"][:34], note), flush=True)
-            if status == "verify":
-                kind = (extra or "").split(":")[1] if ":" in (extra or "") else None
+
+    pending = [r for r in rows if state.get(key_of(r), {}).get("status") != "ok"]
+    if a.limit:
+        pending = pending[:a.limit]
+    conc = max(1, min(int(getattr(a, "concurrency", 1) or 1), 6))
+
+    if conc == 1:
+        b = Browser(a.cdp)
+        try:
+            for i, r in enumerate(pending, 1):
+                status, note, fname = _download_one(b, r, outdir, a)
+                record(r, status, note, fname)
+                print("%3d %-11s %-40s %s" % (i, status, r["title"][:34], note), flush=True)
+                if status == "verify":
+                    if a.on_verify == "stop":
+                        _pause_for_human(b, a, None)
+                        fail("已暂停并等待人工完成验证；完成后重跑本命令（台账会跳过已完成）", 2)
+                    if _pause_for_human(b, a, None):
+                        print("  >> 滑块已通过，重试本篇", flush=True)
+                        time.sleep(1)
+                        st2, n2, f2 = _download_one(b, r, outdir, a)
+                        record(r, st2, "after_verify " + n2, f2)
+                        print("  retry %-10s %s" % (st2, r["title"][:30]), flush=True)
+                    else:
+                        fail("等待人工验证超时；已完成项已入台账，可稍后重跑", 2)
+                if a.gap:
+                    time.sleep(a.gap)
+        finally:
+            b.close()
+    else:
+        stop = threading.Event()
+        chunks = [pending[i::conc] for i in range(conc)]
+
+        def worker(idx, chunk):
+            bb = Browser(a.cdp)          # 每个线程独立连接，避免跨线程共享
+            try:
+                for r in chunk:
+                    if stop.is_set():
+                        return
+                    status, note, fname = _download_one(bb, r, outdir, a)
+                    record(r, status, note, fname)
+                    print("  w%d %-11s %-38s %s" % (idx, status, r["title"][:32], note), flush=True)
+                    if status == "verify":
+                        stop.set()
+                        return
+                    if a.gap:
+                        time.sleep(a.gap)
+            finally:
+                bb.close()
+
+        ths = [threading.Thread(target=worker, args=(i, c), daemon=True)
+               for i, c in enumerate(chunks)]
+        [t.start() for t in ths]
+        [t.join() for t in ths]
+
+        # 并发中遇到验证码：统一暂停一次，再把未完成的串行补下
+        failed = [r for r in pending if state.get(key_of(r), {}).get("status") != "ok"]
+        if any(state.get(key_of(r), {}).get("status") == "verify" for r in pending):
+            b = Browser(a.cdp)
+            try:
                 if a.on_verify == "stop":
-                    _pause_for_human(b, a, kind)
+                    _pause_for_human(b, a, None)
                     fail("已暂停并等待人工完成验证；完成后重跑本命令（台账会跳过已完成）", 2)
-                if _pause_for_human(b, a, kind):
-                    print("  >> 滑块已通过，重试本篇", flush=True)
-                    state.pop(key, None)
-                    time.sleep(2)
-                    _retry_one(b, r, outdir, state, state_path, a)
+                if _pause_for_human(b, a, None):
+                    print("  >> 验证已通过，串行补下剩余 %d 篇" % len(failed), flush=True)
+                    for j, r in enumerate(failed, 1):
+                        st, n2, f2 = _download_one(b, r, outdir, a)
+                        record(r, st, n2, f2)
+                        print("%3d %-11s %-40s %s" % (j, st, r["title"][:34], n2), flush=True)
+                        if a.gap:
+                            time.sleep(a.gap)
                 else:
-                    fail("等待滑块超时；已完成项已记入台账，可稍后重跑", 2)
-            time.sleep(a.gap)
-    finally:
-        b.close()
+                    fail("等待人工验证超时；已完成项已入台账，可稍后重跑", 2)
+            finally:
+                b.close()
+
     okc = sum(1 for v in state.values() if v["status"] == "ok")
-    print("下载结束：成功 %d 篇；台账 %s" % (okc, state_path))
+    print("下载结束：成功 %d 篇%s；台账 %s" % (okc, "（并发 %d）" % conc if conc > 1 else "", state_path))
 
 
 # ---------------------------------------------------------------- verify

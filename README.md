@@ -33,8 +33,8 @@ python3 $S metadata --in rec.json --out rec_meta.json
 # 摘要、关键词、基金
 python3 $S abstract --in rec_meta.json --out rec_abs.json
 
-# 下载 PDF（遇到验证码暂停提醒）
-python3 $S download --in rec_abs.json --dir PDF
+# 下载 PDF（遇到验证码暂停提醒）；并发 3 约快 2.5 倍，但更容易触发验证
+python3 $S download --in rec_abs.json --dir PDF --concurrency 3 --gap 1
 
 # 校验已下载文件
 python3 $S verify --dir PDF --in rec_abs.json
